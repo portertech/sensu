@@ -1,8 +1,11 @@
 require "rspec"
 require "eventmachine"
 require "em-http-request"
-require "uuidtools"
-require "multi_json"
+require "securerandom"
+require "sensu/json"
+require "webmock/rspec"
+
+WebMock.allow_net_connect!
 
 module Helpers
   def setup_options
@@ -19,7 +22,7 @@ module Helpers
   end
 
   def setup_redis
-    @redis = EM::Protocols::Redis.connect
+    @redis = EM.connect("127.0.0.1", 6379, Sensu::Redis::Client)
   end
 
   def redis
@@ -27,22 +30,30 @@ module Helpers
   end
 
   def setup_transport
-    @transport = Sensu::Transport.connect("rabbitmq", {})
-  end
-
-  def transport
-    @transport ? @transport : setup_transport
-  end
-
-  def keepalive_queue(&callback)
-    transport.subscribe(:direct, "keepalives", "keepalives") do |_, payload|
-      callback.call(payload)
+    if @transport
+      yield @transport if block_given?
+    else
+      Sensu::Transport.connect("rabbitmq") do |transport|
+        transport.logger = Sensu::Logger.get
+        @transport = transport
+        yield transport if block_given?
+      end
     end
   end
 
-  def result_queue(&callback)
-    transport.subscribe(:direct, "results", "results") do |_, payload|
-      callback.call(payload)
+  def keepalive_queue
+    setup_transport do |transport|
+      transport.subscribe(:direct, "keepalives", "keepalives") do |_, payload|
+        yield payload
+      end
+    end
+  end
+
+  def result_queue
+    setup_transport do |transport|
+      transport.subscribe(:direct, "results", "results") do |_, payload|
+        yield payload
+      end
     end
   end
 
@@ -68,8 +79,7 @@ module Helpers
 
   def api_test(&callback)
     async_wrapper do
-      Sensu::API::Process.test(options)
-      timer(0.5) do
+      Sensu::API::Process.test(options) do
         callback.call
       end
     end
@@ -105,11 +115,13 @@ module Helpers
   def check_template
     {
       :name => "test",
+      :type => "standard",
       :issued => epoch,
       :command => "echo WARNING && exit 1",
       :output => "WARNING",
       :status => 1,
-      :executed => 1363224805
+      :executed => 1363224805,
+      :interval => 60
     }
   end
 
@@ -126,17 +138,20 @@ module Helpers
     check = check_template
     check[:history] = [1]
     {
-      :id => UUIDTools::UUID.random_create.to_s,
+      :id => ::SecureRandom.uuid,
       :client => client,
       :check => check,
       :occurrences => 1,
+      :silenced => false,
+      :silenced_by => [],
       :action => :create
     }
   end
 
-  def api_request(uri, method=:get, options={}, &callback)
+  def http_request(port, uri, method=:get, options={}, &callback)
     default_options = {
       :head => {
+        :content_type => "application/json",
         :authorization => [
           "foo",
           "bar"
@@ -145,15 +160,15 @@ module Helpers
     }
     request_options = default_options.merge(options)
     if request_options[:body].is_a?(Hash) || request_options[:body].is_a?(Array)
-      request_options[:body] = MultiJson.dump(request_options[:body])
+      request_options[:body] = Sensu::JSON.dump(request_options[:body])
     end
-    http = EM::HttpRequest.new("http://localhost:4567#{uri}").send(method, request_options)
+    http = EM::HttpRequest.new("http://127.0.0.1:#{port}#{uri}").send(method, request_options)
     http.callback do
       body = case
       when http.response.empty?
         http.response
       else
-        MultiJson.load(http.response)
+        Sensu::JSON.load(http.response)
       end
       callback.call(http, body)
     end
@@ -166,7 +181,7 @@ module Helpers
 
     def receive_data(data)
       if @expected
-        expect(MultiJson.load(data)).to eq(MultiJson.load(@expected))
+        expect(Sensu::JSON.load(data)).to eq(Sensu::JSON.load(@expected))
         EM::stop_event_loop
       end
     end

@@ -1,4 +1,5 @@
-require "multi_json"
+require "sensu/json"
+require "sensu/client/utils"
 
 module Sensu
   module Client
@@ -47,7 +48,7 @@ module Sensu
     # of data was received, the agent will give up on the sender, and
     # instead respond +"invalid"+ and close the connection.
     class Socket < EM::Connection
-      class DataError < StandardError; end
+      include CheckUtils
 
       attr_accessor :logger, :settings, :transport, :protocol
 
@@ -67,6 +68,9 @@ module Sensu
       # REJECT mode. No longer receiving data from sender. Discard
       # chunks of data in this mode, the connection is being closed.
       MODE_REJECT = :REJECT
+
+      # PING request string, identifying a connection ping request.
+      PING_REQUEST = "ping".freeze
 
       # Initialize instance variables that will be used throughout the
       # lifetime of the connection. This method is called when the
@@ -112,66 +116,24 @@ module Sensu
         end
       end
 
-      # Validate check result attributes.
-      #
-      # @param [Hash] check result to validate.
-      def validate_check_result(check)
-        unless check[:name] =~ /\A[\w\.-]+\z/
-          raise DataError, "check name must be a string and cannot contain spaces or special characters"
-        end
-        unless check[:source].nil? || check[:source] =~ /\A[\w\.-]+\z/
-          raise DataError, "check source must be a string and cannot contain spaces or special characters"
-        end
-        unless check[:output].is_a?(String)
-          raise DataError, "check output must be a string"
-        end
-        unless check[:status].is_a?(Integer)
-          raise DataError, "check status must be an integer"
-        end
-        unless check[:executed].is_a?(Integer)
-          raise DataError, "check executed timestamp must be an integer"
-        end
-      end
-
-      # Publish a check result to the Sensu transport.
-      #
-      # @param [Hash] check result.
-      def publish_check_result(check)
-        payload = {
-          :client => @settings[:client][:name],
-          :check => check.merge(:issued => Time.now.to_i)
-        }
-        @logger.info("publishing check result", {
-          :payload => payload
-        })
-        @transport.publish(:direct, "results", MultiJson.dump(payload))
-      end
-
-      # Process a check result. Set check result attribute defaults,
-      # validate the attributes, publish the check result to the Sensu
-      # transport, and respond to the sender with the message +"ok"+.
-      #
-      # @param [Hash] check result to be validated and published.
-      # @raise [DataError] if +check+ is invalid.
-      def process_check_result(check)
-        check[:status] ||= 0
-        check[:executed] ||= Time.now.to_i
-        validate_check_result(check)
-        publish_check_result(check)
-        respond("ok")
-      end
-
-      # Parse a JSON check result. For UDP, immediately raise a parser
-      # error. For TCP, record parser errors, so the connection
-      # +watchdog+ can report them.
+      # Parse one or more JSON check results. For UDP, immediately
+      # raise a parser error. For TCP, record parser errors, so the
+      # connection +watchdog+ can report them.
       #
       # @param [String] data to parse for a check result.
       def parse_check_result(data)
         begin
-          check = MultiJson.load(data)
+          object = Sensu::JSON.load(data)
           cancel_watchdog
-          process_check_result(check)
-        rescue MultiJson::ParseError, ArgumentError => error
+          if object.is_a?(Array)
+            object.each do |check|
+              process_check_result(check)
+            end
+          else
+            process_check_result(object)
+          end
+          respond("ok")
+        rescue Sensu::JSON::ParseError, ArgumentError => error
           if @protocol == :tcp
             @parse_error = error.to_s
           else
@@ -186,16 +148,14 @@ module Sensu
       #
       # @param [String] data to be processed.
       def process_data(data)
-        if data.bytes.find { |char| char > 0x80 }
-          @logger.warn("socket received non-ascii characters")
-          respond("invalid")
-        elsif data.strip == "ping"
+        if data.strip == PING_REQUEST
           @logger.debug("socket received ping")
           respond("pong")
         else
-          @logger.debug("socket received data", {
-            :data => data
-          })
+          @logger.debug("socket received data", :data => data)
+          unless valid_utf8?(data)
+            @logger.warn("data from socket is not a valid UTF-8 sequence, processing it anyways", :data => data)
+          end
           begin
             parse_check_result(data)
           rescue => error
@@ -206,6 +166,20 @@ module Sensu
             respond("invalid")
           end
         end
+      end
+
+      # Tests if the argument (data) is a valid UTF-8 sequence.
+      #
+      # @param [String] data to be tested.
+      def valid_utf8?(data)
+        utf8_string_pattern = /\A([\x00-\x7f]|
+                                  [\xc2-\xdf][\x80-\xbf]|
+                                  \xe0[\xa0-\xbf][\x80-\xbf]|
+                                  [\xe1-\xef][\x80-\xbf]{2}|
+                                  \xf0[\x90-\xbf][\x80-\xbf]{2}|
+                                  [\xf1-\xf7][\x80-\xbf]{3})*\z/nx
+        data = data.force_encoding('BINARY') if data.respond_to?(:force_encoding)
+        return data =~ utf8_string_pattern
       end
 
       # This method is called whenever data is received. For UDP, it
@@ -220,7 +194,7 @@ module Sensu
           when :udp
             process_data(data)
           when :tcp
-            if EM.reactor_running?
+            if EM::reactor_running?
               reset_watchdog
             end
             @data_buffer << data

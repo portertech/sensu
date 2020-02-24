@@ -1,52 +1,94 @@
 require "rubygems"
 
-gem "multi_json", "1.11.2"
-gem "eventmachine", "1.0.8"
+gem "eventmachine", "1.2.7"
 
-gem "sensu-logger", "1.1.0"
-gem "sensu-settings", "3.1.0"
-gem "sensu-extension", "1.3.0"
-gem "sensu-extensions", "1.4.0"
-gem "sensu-transport", "3.3.0"
-gem "sensu-spawn", "1.6.0"
+gem "sensu-json", "2.1.1"
+gem "sensu-logger", "1.2.2"
+gem "sensu-settings", "10.17.0"
+gem "sensu-extension", "1.5.2"
+gem "sensu-extensions", "1.11.0"
+gem "sensu-transport", "8.3.0"
+gem "sensu-spawn", "2.5.0"
+gem "sensu-redis", "2.4.0"
 
 require "time"
 require "uri"
 
+if RUBY_PLATFORM =~ /aix/ || RUBY_PLATFORM =~ /solaris/
+  require "em/pure_ruby"
+end
+
+require "sensu/json"
 require "sensu/logger"
 require "sensu/settings"
 require "sensu/extensions"
 require "sensu/transport"
 require "sensu/spawn"
+require "sensu/redis"
 
 require "sensu/constants"
 require "sensu/utilities"
 require "sensu/cli"
-require "sensu/redis"
-
-# Symbolize hash keys when parsing JSON.
-MultiJson.load_options = {:symbolize_keys => true}
 
 module Sensu
   module Daemon
     include Utilities
 
-    attr_reader :start_time
+    attr_reader :start_time, :settings
 
     # Initialize the Sensu process. Set the start time, initial
-    # service state, set up the logger, load settings, load
-    # extensions, and optionally daemonize the process and/or create a
-    # PID file. A subclass may override this method.
+    # service state, double the maximum number of EventMachine timers,
+    # set up the logger, and load settings. This method will load
+    # extensions and setup Sensu Spawn if the Sensu process is not the
+    # Sensu API. This method can and optionally daemonize the process
+    # and/or create a PID file.
     #
     # @param options [Hash]
     def initialize(options={})
       @start_time = Time.now.to_i
       @state = :initializing
       @timers = {:run => []}
+      unless EM::reactor_running?
+        EM::epoll
+        EM::set_max_timers(200000)
+        EM::error_handler do |error|
+          unexpected_error(error)
+        end
+      end
       setup_logger(options)
       load_settings(options)
-      load_extensions(options)
+      unless sensu_service_name == "api"
+        load_extensions(options)
+        setup_spawn
+      end
       setup_process(options)
+    end
+
+    # Handle an unexpected error. This method is used for EM global
+    # catch-all error handling, accepting an error object. Error
+    # handling is opt-in via a configuration option, e.g. `"sensu":
+    # {"global_error_handler": true}`. If a user does not opt-in, the
+    # provided error will be raised (uncaught). If a user opts-in via
+    # configuration, the error will be logged and ignored :itsfine:.
+    #
+    # @param error [Object]
+    def unexpected_error(error)
+      if @settings && @settings[:sensu][:global_error_handler]
+        backtrace = error.backtrace.join("\n")
+        if @logger
+          @logger.warn("global catch-all error handling enabled")
+          @logger.fatal("unexpected error - please address this immediately", {
+            :error => error.to_s,
+            :error_class => error.class,
+            :backtrace => backtrace
+          })
+        else
+          puts "global catch-all error handling enabled"
+          puts "unexpected error - please address this immediately: #{error.to_s}\n#{error.class}\n#{backtrace}"
+        end
+      else
+        raise error
+      end
     end
 
     # Set up the Sensu logger and its process signal traps for log
@@ -61,39 +103,79 @@ module Sensu
       @logger.setup_signal_traps
     end
 
-    # Log setting or extension loading concerns, sensitive information
+    # Log setting or extension loading notices, sensitive information
     # is redacted.
     #
-    # @param concerns [Array] to be logged.
-    # @param level [Symbol] to log the concerns at.
-    def log_concerns(concerns=[], level=:warn)
-      concerns.each do |concern|
+    # @param notices [Array] to be logged.
+    # @param level [Symbol] to log the notices at.
+    def log_notices(notices=[], level=:warn)
+      notices.each do |concern|
         message = concern.delete(:message)
         @logger.send(level, message, redact_sensitive(concern))
       end
     end
 
-    # Load Sensu settings and validate them. If there are validation
-    # failures, log them (concerns), then cause the Sensu process to
-    # exit (2). This method creates the settings instance variable:
-    # `@settings`.
+    # Determine if the Sensu settings are valid, if there are load or
+    # validation errors, and immediately exit the process with the
+    # appropriate exit status code. This method is used to determine
+    # if the latest configuration changes are valid prior to
+    # restarting the Sensu service, triggered by a CLI argument, e.g.
+    # `--validate_config`.
+    #
+    # @param settings [Object]
+    def validate_settings!(settings)
+      if settings.errors.empty?
+        puts "configuration is valid"
+        exit
+      else
+        puts "configuration is invalid"
+        puts Sensu::JSON.dump({:errors => @settings.errors}, :pretty => true)
+        exit 2
+      end
+    end
+
+    # Print the Sensu settings (JSON) to STDOUT and immediately exit
+    # the process with the appropriate exit status code. This method
+    # is used while troubleshooting configuration issues, triggered by
+    # a CLI argument, e.g. `--print_config`. Sensu settings with
+    # sensitive values (e.g. passwords) are first redacted.
+    #
+    # @param settings [Object]
+    def print_settings!(settings)
+      redacted_settings = redact_sensitive(settings.to_hash)
+      @logger.warn("outputting compiled configuration and exiting")
+      puts Sensu::JSON.dump(redacted_settings, :pretty => true)
+      exit(settings.errors.empty? ? 0 : 2)
+    end
+
+    # Load Sensu settings. This method creates the settings instance
+    # variable: `@settings`. If the `validate_config` option is true,
+    # this method calls `validate_settings!()` to validate the latest
+    # compiled configuration settings and will then exit the process.
+    # If the `print_config` option is true, this method calls
+    # `print_settings!()` to output the compiled configuration
+    # settings and will then exit the process. If there are loading or
+    # validation errors, they will be logged (notices), and this
+    # method will exit(2) the process.
+    #
     #
     # https://github.com/sensu/sensu-settings
     #
     # @param options [Hash]
     def load_settings(options={})
       @settings = Settings.get(options)
-      log_concerns(@settings.warnings)
-      failures = @settings.validate
-      unless failures.empty?
-        @logger.fatal("invalid settings")
-        log_concerns(failures, :fatal)
+      validate_settings!(@settings) if options[:validate_config]
+      log_notices(@settings.warnings)
+      log_notices(@settings.errors, :fatal)
+      print_settings!(@settings) if options[:print_config]
+      unless @settings.errors.empty?
         @logger.fatal("SENSU NOT RUNNING!")
         exit 2
       end
+      @settings.set_env!
     end
 
-    # Load Sensu extensions and log any concerns. Set the logger and
+    # Load Sensu extensions and log any notices. Set the logger and
     # settings for each extension instance. This method creates the
     # extensions instance variable: `@extensions`.
     #
@@ -102,13 +184,28 @@ module Sensu
     #
     # @param options [Hash]
     def load_extensions(options={})
-      @extensions = Extensions.get(options)
-      log_concerns(@extensions.warnings)
+      extensions_options = options.merge(:extensions => @settings[:extensions])
+      @extensions = Extensions.get(extensions_options)
+      log_notices(@extensions.warnings)
       extension_settings = @settings.to_hash.dup
       @extensions.all.each do |extension|
         extension.logger = @logger
         extension.settings = extension_settings
       end
+    end
+
+    # Set up Sensu spawn, creating a worker to create, control, and
+    # limit spawned child processes. This method adjusts the
+    # EventMachine thread pool size to accommodate the concurrent
+    # process spawn limit and other Sensu process operations.
+    #
+    # https://github.com/sensu/sensu-spawn
+    def setup_spawn
+      @logger.info("configuring sensu spawn", :settings => @settings[:sensu][:spawn])
+      threadpool_size = @settings[:sensu][:spawn][:limit] + 10
+      @logger.debug("setting eventmachine threadpool size", :size => threadpool_size)
+      EM::threadpool_size = threadpool_size
+      Spawn.setup(@settings[:sensu][:spawn])
     end
 
     # Manage the current process, optionally daemonize and/or write
@@ -121,9 +218,11 @@ module Sensu
     end
 
     # Start the Sensu service and set the service state to `:running`.
-    # This method will likely be overridden by a subclass.
+    # This method will likely be overridden by a subclass. Yield if a
+    # block is provided.
     def start
       @state = :running
+      yield if block_given?
     end
 
     # Pause the Sensu service and set the service state to `:paused`.
@@ -176,6 +275,9 @@ module Sensu
     # method creates the transport instance variable: `@transport`.
     #
     # https://github.com/sensu/sensu-transport
+    #
+    # @yield [Object] passes initialized and connected Transport
+    #   connection object to the callback/block.
     def setup_transport
       transport_name = @settings[:transport][:name]
       transport_settings = @settings[transport_name]
@@ -184,24 +286,27 @@ module Sensu
         :settings => transport_settings
       })
       Transport.logger = @logger
-      @transport = Transport.connect(transport_name, transport_settings)
-      @transport.on_error do |error|
-        @logger.fatal("transport connection error", :error => error.to_s)
-        if @settings[:transport][:reconnect_on_error]
-          @transport.reconnect
-        else
-          stop
+      Transport.connect(transport_name, transport_settings) do |connection|
+        @transport = connection
+        @transport.on_error do |error|
+          @logger.error("transport connection error", :error => error.to_s)
+          if @settings[:transport][:reconnect_on_error]
+            @transport.reconnect
+          else
+            stop
+          end
         end
-      end
-      @transport.before_reconnect do
-        unless testing?
-          @logger.warn("reconnecting to transport")
-          pause
+        @transport.before_reconnect do
+          unless testing?
+            @logger.warn("reconnecting to transport")
+            pause
+          end
         end
-      end
-      @transport.after_reconnect do
-        @logger.info("reconnected to transport")
-        resume
+        @transport.after_reconnect do
+          @logger.info("reconnected to transport")
+          resume
+        end
+        yield(@transport) if block_given?
       end
     end
 
@@ -210,26 +315,41 @@ module Sensu
     # service will stop gracefully in the event of a Redis error, and
     # pause/resume in the event of connectivity issues. This method
     # creates the Redis instance variable: `@redis`.
+    #
+    # https://github.com/sensu/sensu-redis
+    #
+    # @yield [Object] passes initialized and connected Redis
+    #   connection object to the callback/block.
     def setup_redis
       @logger.debug("connecting to redis", :settings => @settings[:redis])
-      @redis = Redis.connect(@settings[:redis])
-      @redis.on_error do |error|
-        @logger.fatal("redis connection error", :error => error.to_s)
-        stop
-      end
-      @redis.before_reconnect do
-        unless testing?
-          @logger.warn("reconnecting to redis")
-          pause
+      Redis.logger = @logger
+      Redis.connect(@settings[:redis]) do |connection|
+        @redis = connection
+        @redis.on_error do |error|
+          @logger.error("redis connection error", :error => error.to_s)
         end
-      end
-      @redis.after_reconnect do
-        @logger.info("reconnected to redis")
-        resume
+        @redis.before_reconnect do
+          unless testing?
+            @logger.warn("reconnecting to redis")
+            pause
+          end
+        end
+        @redis.after_reconnect do
+          @logger.info("reconnected to redis")
+          resume
+        end
+        yield(@redis) if block_given?
       end
     end
 
     private
+
+    # Get the Sensu service name.
+    #
+    # @return [String] Sensu service name.
+    def sensu_service_name
+      File.basename($0).split("-").last
+    end
 
     # Write the current process ID (PID) to a file (PID file). This
     # method will cause the Sensu service to exit (2) if the PID file
